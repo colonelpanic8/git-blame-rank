@@ -1,3 +1,78 @@
-fn main() {
-    println!("git-blame-rank is not implemented yet.");
+mod app;
+mod cli;
+mod event;
+mod git;
+mod tui;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use cli::{Cli, OutputMode};
+
+use crate::app::AppState;
+use crate::git::{ScanConfig, discover_files, start_scan};
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let repo_root = cli
+        .repo
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", cli.repo.display()))?;
+    let jobs = cli.jobs.unwrap_or_else(default_jobs).max(1);
+
+    let files = discover_files(&repo_root, &cli.rev)?;
+    let mut app_state = AppState::new(repo_root.clone(), cli.rev.clone(), jobs, files.clone());
+    let scan_handle = start_scan(
+        ScanConfig {
+            repo_root,
+            rev: cli.rev.clone().into(),
+            jobs,
+        },
+        &files,
+    );
+
+    let run_result = match cli.mode {
+        OutputMode::Tui => tui::run(&mut app_state, &scan_handle.event_rx),
+        OutputMode::Report => {
+            while let Ok(worker_event) = scan_handle.event_rx.recv() {
+                app_state.apply_worker_event(worker_event);
+                if app_state.is_finished() {
+                    break;
+                }
+            }
+            print_report(&app_state);
+            Ok(())
+        }
+    };
+
+    scan_handle.join();
+    run_result
+}
+
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get().min(8))
+        .unwrap_or(4)
+}
+
+fn print_report(app_state: &AppState) {
+    println!(
+        "repo={} rev={} files={}/{} failures={} lines={}",
+        app_state.repo_root.display(),
+        app_state.rev,
+        app_state.processed_files,
+        app_state.total_files,
+        app_state.failed_files,
+        app_state.total_lines,
+    );
+
+    for row in app_state.author_rows() {
+        println!(
+            "{:>8} {:>6} {:>8}  {} <{}>",
+            row.lines,
+            row.files,
+            row.commits,
+            row.author.display_name(),
+            row.author.email,
+        );
+    }
 }
