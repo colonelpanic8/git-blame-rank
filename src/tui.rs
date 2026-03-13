@@ -55,10 +55,14 @@ fn run_loop(
                     KeyCode::Down | KeyCode::Char('j') => match app_state.focus {
                         FocusPane::Tree => app_state.move_tree_selection(1),
                         FocusPane::Extensions => app_state.move_extension_selection(1),
+                        FocusPane::Rankings => app_state.move_author_selection(1),
+                        FocusPane::Recent => app_state.move_recent_selection(1),
                     },
                     KeyCode::Up | KeyCode::Char('k') => match app_state.focus {
                         FocusPane::Tree => app_state.move_tree_selection(-1),
                         FocusPane::Extensions => app_state.move_extension_selection(-1),
+                        FocusPane::Rankings => app_state.move_author_selection(-1),
+                        FocusPane::Recent => app_state.move_recent_selection(-1),
                     },
                     KeyCode::Left | KeyCode::Char('h') => {
                         if app_state.focus == FocusPane::Tree {
@@ -73,6 +77,7 @@ fn run_loop(
                     KeyCode::Char(' ') => match app_state.focus {
                         FocusPane::Tree => app_state.toggle_selected_tree_node(),
                         FocusPane::Extensions => app_state.toggle_selected_extension(),
+                        FocusPane::Rankings | FocusPane::Recent => {}
                     },
                     _ => {}
                 }
@@ -149,7 +154,8 @@ fn draw(frame: &mut Frame<'_>, app_state: &AppState) {
     let footer_text = format!(
         "{scan_state}  focus={}  tab switch pane  q/esc quit\n\
 tree: j/k or arrows move  h/l or arrows collapse expand  space toggle subtree/file\n\
-ext:  j/k or arrows move  space toggle extension",
+ext:  j/k or arrows move  space toggle extension\n\
+lists: j/k or arrows scroll rankings or recent files",
         focus_label(app_state.focus),
     );
     let footer =
@@ -249,11 +255,20 @@ fn draw_extensions(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::l
 }
 
 fn draw_rankings(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::layout::Rect) {
-    let author_rows = app_state
-        .author_rows()
-        .into_iter()
-        .take(area.height.saturating_sub(3) as usize)
-        .map(|row| {
+    let author_rows = app_state.author_rows();
+    let selected_index = app_state
+        .selected_author_row
+        .min(author_rows.len().saturating_sub(1));
+    let window = visible_window(
+        selected_index,
+        author_rows.len(),
+        area.height.saturating_sub(3) as usize,
+    );
+
+    let rows = author_rows[window.clone()]
+        .iter()
+        .enumerate()
+        .map(|(offset, row)| {
             Row::new([
                 Cell::from(row.author.display_name().to_owned()),
                 Cell::from(row.author.email.to_string()),
@@ -261,11 +276,24 @@ fn draw_rankings(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::lay
                 Cell::from(row.files.to_string()),
                 Cell::from(row.commits.to_string()),
             ])
+            .style(
+                if window.start + offset == selected_index && app_state.focus == FocusPane::Rankings
+                {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                },
+            )
         });
 
-    let title = format!("Rankings ({})", app_state.current_scope_label());
+    let title = format!(
+        "Rankings ({}) {}/{}",
+        app_state.current_scope_label(),
+        selected_index.saturating_add(1).min(author_rows.len()),
+        author_rows.len(),
+    );
     let author_table = Table::new(
-        author_rows,
+        rows,
         [
             Constraint::Length(20),
             Constraint::Length(24),
@@ -283,11 +311,21 @@ fn draw_rankings(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::lay
 }
 
 fn draw_recent(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::layout::Rect) {
+    let selected_index = app_state
+        .selected_recent_file
+        .min(app_state.recent_files.len().saturating_sub(1));
+    let window = visible_window(
+        selected_index,
+        app_state.recent_files.len(),
+        area.height.saturating_sub(3) as usize,
+    );
     let recent_rows = app_state
         .recent_files
         .iter()
-        .take(area.height.saturating_sub(3) as usize)
-        .map(|file| {
+        .skip(window.start)
+        .take(window.end - window.start)
+        .enumerate()
+        .map(|(offset, file)| {
             let status = match file.status {
                 RecentFileStatus::Complete => "ok",
                 RecentFileStatus::Failed => "err",
@@ -299,7 +337,21 @@ fn draw_recent(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::layou
                 Cell::from(format_duration(file.elapsed)),
                 Cell::from(file.path.clone()),
             ])
+            .style(
+                if window.start + offset == selected_index && app_state.focus == FocusPane::Recent {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                },
+            )
         });
+    let title = format!(
+        "Recent Files {}/{}",
+        selected_index
+            .saturating_add(1)
+            .min(app_state.recent_files.len()),
+        app_state.recent_files.len(),
+    );
     let recent_table = Table::new(
         recent_rows,
         [
@@ -313,7 +365,7 @@ fn draw_recent(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::layou
         Row::new(["state", "lines", "elapsed", "path"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
-    .block(Block::default().title("Recent Files").borders(Borders::ALL));
+    .block(Block::default().title(title).borders(Borders::ALL));
     frame.render_widget(recent_table, area);
 }
 
@@ -321,6 +373,8 @@ fn focus_label(focus: FocusPane) -> &'static str {
     match focus {
         FocusPane::Tree => "tree",
         FocusPane::Extensions => "extensions",
+        FocusPane::Rankings => "rankings",
+        FocusPane::Recent => "recent",
     }
 }
 

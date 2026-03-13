@@ -91,6 +91,8 @@ pub struct AuthorRow {
 pub enum FocusPane {
     Tree,
     Extensions,
+    Rankings,
+    Recent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -143,6 +145,8 @@ pub struct AppState {
     pub selected_tree_node: usize,
     pub extension_filters: Vec<ExtensionFilter>,
     pub selected_extension: usize,
+    pub selected_author_row: usize,
+    pub selected_recent_file: usize,
     pub focus: FocusPane,
 }
 
@@ -249,11 +253,13 @@ impl AppState {
             failed_files: 0,
             total_lines: 0,
             file_records,
-            recent_files: VecDeque::with_capacity(16),
+            recent_files: VecDeque::with_capacity(256),
             tree_nodes,
             selected_tree_node: 0,
             extension_filters,
             selected_extension: 0,
+            selected_author_row: 0,
+            selected_recent_file: 0,
             focus: FocusPane::Tree,
         }
     }
@@ -457,7 +463,9 @@ impl AppState {
     pub fn cycle_focus(&mut self) {
         self.focus = match self.focus {
             FocusPane::Tree => FocusPane::Extensions,
-            FocusPane::Extensions => FocusPane::Tree,
+            FocusPane::Extensions => FocusPane::Rankings,
+            FocusPane::Rankings => FocusPane::Recent,
+            FocusPane::Recent => FocusPane::Tree,
         };
     }
 
@@ -473,6 +481,26 @@ impl AppState {
         if let Some(extension) = self.extension_filters.get_mut(self.selected_extension) {
             extension.enabled = !extension.enabled;
         }
+    }
+
+    pub fn move_author_selection(&mut self, delta: isize) {
+        let total = self.author_rows().len();
+        if total == 0 {
+            self.selected_author_row = 0;
+            return;
+        }
+        let next_index = self.selected_author_row.saturating_add_signed(delta);
+        self.selected_author_row = next_index.min(total - 1);
+    }
+
+    pub fn move_recent_selection(&mut self, delta: isize) {
+        let total = self.recent_files.len();
+        if total == 0 {
+            self.selected_recent_file = 0;
+            return;
+        }
+        let next_index = self.selected_recent_file.saturating_add_signed(delta);
+        self.selected_recent_file = next_index.min(total - 1);
     }
 
     pub fn selected_extension_label(&self) -> &str {
@@ -500,10 +528,11 @@ impl AppState {
     }
 
     fn push_recent_file(&mut self, recent_file: RecentFile) {
-        if self.recent_files.len() == 16 {
+        if self.recent_files.len() == 256 {
             self.recent_files.pop_back();
         }
         self.recent_files.push_front(recent_file);
+        self.selected_recent_file = self.selected_recent_file.min(self.recent_files.len() - 1);
     }
 
     fn file_in_scope(&self, record: &FileRecord, scope: usize) -> bool {
