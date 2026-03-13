@@ -1,0 +1,22 @@
+# Build artifacts
+/target/
+
+# Nix
+/result
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Worktrees
+.worktrees/
+
+# Browser automation artifacts
+.playwright-cli/
