@@ -132,6 +132,7 @@ pub struct AppState {
     pub rev: String,
     pub jobs: usize,
     pub started_at: Instant,
+    pub completed_at: Option<Instant>,
     pub total_files: usize,
     pub processed_files: usize,
     pub failed_files: usize,
@@ -242,6 +243,7 @@ impl AppState {
             rev,
             jobs,
             started_at: Instant::now(),
+            completed_at: None,
             total_files,
             processed_files: 0,
             failed_files: 0,
@@ -268,7 +270,10 @@ impl AppState {
     }
 
     pub fn elapsed(&self) -> Duration {
-        self.started_at.elapsed()
+        match self.completed_at {
+            Some(completed_at) => completed_at.duration_since(self.started_at),
+            None => self.started_at.elapsed(),
+        }
     }
 
     pub fn apply_worker_event(&mut self, event: WorkerEvent) {
@@ -328,6 +333,10 @@ impl AppState {
                     elapsed,
                 });
             }
+        }
+
+        if self.completed_at.is_none() && self.is_finished() {
+            self.completed_at = Some(Instant::now());
         }
     }
 

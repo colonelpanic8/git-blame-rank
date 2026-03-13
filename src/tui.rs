@@ -87,7 +87,7 @@ fn draw(frame: &mut Frame<'_>, app_state: &AppState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Min(14),
             Constraint::Length(8),
             Constraint::Length(4),
@@ -110,9 +110,18 @@ fn draw(frame: &mut Frame<'_>, app_state: &AppState) {
         .split(main_chunks[1]);
 
     let (scope_done, scope_total) = app_state.current_scope_file_counts();
+    let elapsed = format_duration(app_state.elapsed());
+    let scan_state = if app_state.is_finished() {
+        "complete"
+    } else {
+        "running"
+    };
     let summary = Paragraph::new(format!(
-        "repo: {}\nscope: {}  focus: {}  jobs: {}  running: {}  done: {}/{}  scope files: {}/{}  failures: {}  lines: {}  elapsed: {}",
+        "repo: {}\nstate: {}  elapsed: {}  rev: {}\nscope: {}  focus: {}  jobs: {}  running: {}\ndone: {}/{}  scope files: {}/{}  failures: {}  lines: {}",
         app_state.repo_root.display(),
+        scan_state,
+        elapsed,
+        app_state.rev,
         app_state.current_scope_label(),
         focus_label(app_state.focus),
         app_state.jobs,
@@ -123,7 +132,6 @@ fn draw(frame: &mut Frame<'_>, app_state: &AppState) {
         scope_total,
         app_state.failed_files,
         app_state.total_lines,
-        format_duration(app_state.elapsed()),
     ))
     .block(Block::default().title("Scan").borders(Borders::ALL));
     frame.render_widget(summary, layout[0]);
@@ -337,7 +345,20 @@ fn visible_window(selected: usize, total: usize, height: usize) -> std::ops::Ran
 
 fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
+    let millis = duration.subsec_millis();
+
+    if seconds < 60 {
+        return format!("{seconds}.{millis:03}s");
+    }
+
     let minutes = seconds / 60;
     let remaining_seconds = seconds % 60;
-    format!("{minutes:02}:{remaining_seconds:02}")
+
+    if minutes < 60 {
+        return format!("{minutes}:{remaining_seconds:02}.{millis:03}");
+    }
+
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    format!("{hours}:{remaining_minutes:02}:{remaining_seconds:02}.{millis:03}")
 }
