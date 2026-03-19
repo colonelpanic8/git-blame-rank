@@ -181,6 +181,7 @@ fn blame_file(repo: &Repository, rev_oid: Oid, path: &BString) -> Result<FileSum
     let path_buf = pathbuf_from_bstring(path);
     let mut options = BlameOptions::new();
     options.newest_commit(rev_oid);
+    options.use_mailmap(true);
     let blame = repo
         .blame_file(&path_buf, Some(&mut options))
         .with_context(|| format!("failed to blame {}", String::from_utf8_lossy(path)))?;
@@ -192,10 +193,7 @@ fn blame_file(repo: &Repository, rev_oid: Oid, path: &BString) -> Result<FileSum
         let lines = hunk.lines_in_hunk() as u32;
         total_lines += lines;
 
-        let commit = repo
-            .find_commit(hunk.final_commit_id())
-            .with_context(|| "failed to look up blamed commit")?;
-        let signature = commit.author();
+        let signature = hunk.final_signature();
         let author = AuthorKey {
             name: SmolStr::new(signature.name().unwrap_or("")),
             email: SmolStr::new(signature.email().unwrap_or("")),
@@ -203,7 +201,7 @@ fn blame_file(repo: &Repository, rev_oid: Oid, path: &BString) -> Result<FileSum
 
         let entry = authors.entry(author).or_default();
         entry.lines += lines;
-        entry.commit_ids.push(commit.id());
+        entry.commit_ids.push(hunk.final_commit_id());
     }
 
     let authors = authors
@@ -412,6 +410,52 @@ mod tests {
             .unwrap();
         assert_eq!(bob.lines, 1);
         assert_eq!(bob.commit_ids, vec![bob_commit]);
+    }
+
+    #[test]
+    fn blame_file_uses_mailmap_to_collapse_author_aliases() {
+        let (_tempdir, repo) = init_repo();
+        let canonical_commit = commit_file(
+            &repo,
+            "src/lib.rs",
+            "alpha\nbeta\ngamma\n",
+            "Alice Example",
+            "alice@example.com",
+            "initial",
+        );
+        let alias_commit = commit_file(
+            &repo,
+            "src/lib.rs",
+            "alpha\nBETA\ngamma\n",
+            "Alice Alias",
+            "alice+alias@example.com",
+            "update middle line",
+        );
+        commit_file(
+            &repo,
+            ".mailmap",
+            "Alice Example <alice@example.com> Alice Alias <alice+alias@example.com>\n",
+            "Maintainer",
+            "maintainer@example.com",
+            "add mailmap",
+        );
+
+        let summary = blame_file(
+            &repo,
+            resolve_commit_oid(&repo, "HEAD").unwrap(),
+            &BString::from("src/lib.rs"),
+        )
+        .unwrap();
+
+        assert_eq!(summary.authors.len(), 1);
+        let author = &summary.authors[0];
+        assert_eq!(author.author.name.as_str(), "Alice Example");
+        assert_eq!(author.author.email.as_str(), "alice@example.com");
+        assert_eq!(author.lines, 3);
+        assert_eq!(
+            author.commit_ids,
+            dedupe_commit_ids(vec![canonical_commit, alias_commit])
+        );
     }
 
     #[test]
