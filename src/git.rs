@@ -33,6 +33,20 @@ impl ScanHandle {
     }
 }
 
+pub fn resolve_repo_root(path: &Path) -> Result<PathBuf> {
+    let repo = Repository::discover(path)
+        .with_context(|| format!("failed to discover git repository from {}", path.display()))?;
+    let workdir = repo.workdir().with_context(|| {
+        format!(
+            "repository at {} does not have a working directory",
+            path.display()
+        )
+    })?;
+    workdir
+        .canonicalize()
+        .with_context(|| format!("failed to resolve repository root {}", workdir.display()))
+}
+
 pub fn discover_files(repo_root: &Path, rev: &str) -> Result<Vec<BString>> {
     let repo = Repository::open(repo_root)
         .with_context(|| format!("failed to open repository at {}", repo_root.display()))?;
@@ -343,6 +357,24 @@ mod tests {
                 BString::from("z-last.txt")
             ]
         );
+    }
+
+    #[test]
+    fn resolve_repo_root_discovers_worktree_root_from_nested_directory() {
+        let (_tempdir, repo) = init_repo();
+        commit_file(
+            &repo,
+            "nested/deeper/file.txt",
+            "content\n",
+            "Alice",
+            "alice@example.com",
+            "initial",
+        );
+
+        let nested_dir = repo.workdir().unwrap().join("nested/deeper");
+        let resolved = resolve_repo_root(&nested_dir).unwrap();
+
+        assert_eq!(resolved, repo.workdir().unwrap().canonicalize().unwrap());
     }
 
     #[test]

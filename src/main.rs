@@ -1,18 +1,15 @@
 mod cli;
 mod tui;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, OutputMode};
 use git_blame_rank::core::ScanState;
-use git_blame_rank::git::{ScanConfig, discover_files, start_scan};
+use git_blame_rank::git::{ScanConfig, discover_files, resolve_repo_root, start_scan};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let repo_root = cli
-        .repo
-        .canonicalize()
-        .with_context(|| format!("failed to resolve {}", cli.repo.display()))?;
+    let repo_root = resolve_repo_root(&cli.repo)?;
     let jobs = cli.jobs.unwrap_or_else(default_jobs).max(1);
 
     let files = discover_files(&repo_root, &cli.rev)?;
