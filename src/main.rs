@@ -1,15 +1,11 @@
-mod app;
 mod cli;
-mod event;
-mod git;
 mod tui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, OutputMode};
-
-use crate::app::AppState;
-use crate::git::{ScanConfig, discover_files, start_scan};
+use git_blame_rank::core::ScanState;
+use git_blame_rank::git::{ScanConfig, discover_files, start_scan};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -20,7 +16,7 @@ fn main() -> Result<()> {
     let jobs = cli.jobs.unwrap_or_else(default_jobs).max(1);
 
     let files = discover_files(&repo_root, &cli.rev)?;
-    let mut app_state = AppState::new(repo_root.clone(), cli.rev.clone(), jobs, files.clone());
+    let mut scan_state = ScanState::new(repo_root.clone(), cli.rev.clone(), jobs, files.clone());
     let scan_handle = start_scan(
         ScanConfig {
             repo_root,
@@ -31,15 +27,15 @@ fn main() -> Result<()> {
     );
 
     let run_result = match cli.mode {
-        OutputMode::Tui => tui::run(&mut app_state, &scan_handle.event_rx),
+        OutputMode::Tui => tui::run(&mut scan_state, &scan_handle.event_rx),
         OutputMode::Report => {
             while let Ok(worker_event) = scan_handle.event_rx.recv() {
-                app_state.apply_worker_event(worker_event);
-                if app_state.is_finished() {
+                scan_state.apply_worker_event(worker_event);
+                if scan_state.is_finished() {
                     break;
                 }
             }
-            print_report(&app_state);
+            print_report(&scan_state);
             Ok(())
         }
     };
@@ -54,18 +50,18 @@ fn default_jobs() -> usize {
         .unwrap_or(4)
 }
 
-fn print_report(app_state: &AppState) {
+fn print_report(scan_state: &ScanState) {
     println!(
         "repo={} rev={} files={}/{} failures={} lines={}",
-        app_state.repo_root.display(),
-        app_state.rev,
-        app_state.processed_files,
-        app_state.total_files,
-        app_state.failed_files,
-        app_state.total_lines,
+        scan_state.repo_root.display(),
+        scan_state.rev,
+        scan_state.processed_files,
+        scan_state.total_files,
+        scan_state.failed_files,
+        scan_state.total_lines,
     );
 
-    for row in app_state.author_rows() {
+    for row in scan_state.all_author_rows() {
         println!(
             "{:>8} {:>6} {:>8}  {} <{}>",
             row.lines,

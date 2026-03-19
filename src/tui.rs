@@ -6,25 +6,27 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use git_blame_rank::core::{NodeKind, RecentFileStatus, ScanState};
+use git_blame_rank::event::WorkerEvent;
+use git_blame_rank::tui_state::{FocusPane, TuiState};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::{Frame, Terminal};
 
-use crate::app::{AppState, FocusPane, NodeKind, RecentFileStatus};
-
 pub fn run(
-    app_state: &mut AppState,
-    event_rx: &crossbeam_channel::Receiver<crate::event::WorkerEvent>,
+    scan_state: &mut ScanState,
+    event_rx: &crossbeam_channel::Receiver<WorkerEvent>,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    let mut tui_state = TuiState::new(scan_state);
 
-    let result = run_loop(&mut terminal, app_state, event_rx);
+    let result = run_loop(&mut terminal, scan_state, &mut tui_state, event_rx);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -35,15 +37,16 @@ pub fn run(
 
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app_state: &mut AppState,
-    event_rx: &crossbeam_channel::Receiver<crate::event::WorkerEvent>,
+    scan_state: &mut ScanState,
+    tui_state: &mut TuiState,
+    event_rx: &crossbeam_channel::Receiver<WorkerEvent>,
 ) -> anyhow::Result<()> {
     loop {
         while let Ok(worker_event) = event_rx.try_recv() {
-            app_state.apply_worker_event(worker_event);
+            scan_state.apply_worker_event(worker_event);
         }
 
-        terminal.draw(|frame| draw(frame, app_state))?;
+        terminal.draw(|frame| draw(frame, scan_state, tui_state))?;
 
         if event::poll(Duration::from_millis(75))? {
             if let CrosstermEvent::Key(key_event) = event::read()?
@@ -51,32 +54,32 @@ fn run_loop(
             {
                 match key_event.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Tab => app_state.cycle_focus(),
-                    KeyCode::Down | KeyCode::Char('j') => match app_state.focus {
-                        FocusPane::Tree => app_state.move_tree_selection(1),
-                        FocusPane::Extensions => app_state.move_extension_selection(1),
-                        FocusPane::Rankings => app_state.move_author_selection(1),
-                        FocusPane::Recent => app_state.move_recent_selection(1),
+                    KeyCode::Tab => tui_state.cycle_focus(),
+                    KeyCode::Down | KeyCode::Char('j') => match tui_state.focus {
+                        FocusPane::Tree => tui_state.move_tree_selection(scan_state, 1),
+                        FocusPane::Extensions => tui_state.move_extension_selection(1),
+                        FocusPane::Rankings => tui_state.move_author_selection(scan_state, 1),
+                        FocusPane::Recent => tui_state.move_recent_selection(scan_state, 1),
                     },
-                    KeyCode::Up | KeyCode::Char('k') => match app_state.focus {
-                        FocusPane::Tree => app_state.move_tree_selection(-1),
-                        FocusPane::Extensions => app_state.move_extension_selection(-1),
-                        FocusPane::Rankings => app_state.move_author_selection(-1),
-                        FocusPane::Recent => app_state.move_recent_selection(-1),
+                    KeyCode::Up | KeyCode::Char('k') => match tui_state.focus {
+                        FocusPane::Tree => tui_state.move_tree_selection(scan_state, -1),
+                        FocusPane::Extensions => tui_state.move_extension_selection(-1),
+                        FocusPane::Rankings => tui_state.move_author_selection(scan_state, -1),
+                        FocusPane::Recent => tui_state.move_recent_selection(scan_state, -1),
                     },
                     KeyCode::Left | KeyCode::Char('h') => {
-                        if app_state.focus == FocusPane::Tree {
-                            app_state.collapse_or_select_parent();
+                        if tui_state.focus == FocusPane::Tree {
+                            tui_state.collapse_or_select_parent(scan_state);
                         }
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
-                        if app_state.focus == FocusPane::Tree {
-                            app_state.expand_selected();
+                        if tui_state.focus == FocusPane::Tree {
+                            tui_state.expand_selected(scan_state);
                         }
                     }
-                    KeyCode::Char(' ') => match app_state.focus {
-                        FocusPane::Tree => app_state.toggle_selected_tree_node(),
-                        FocusPane::Extensions => app_state.toggle_selected_extension(),
+                    KeyCode::Char(' ') => match tui_state.focus {
+                        FocusPane::Tree => tui_state.toggle_selected_tree_node(scan_state),
+                        FocusPane::Extensions => tui_state.toggle_selected_extension(),
                         FocusPane::Rankings | FocusPane::Recent => {}
                     },
                     _ => {}
@@ -88,7 +91,7 @@ fn run_loop(
     Ok(())
 }
 
-fn draw(frame: &mut Frame<'_>, app_state: &AppState) {
+fn draw(frame: &mut Frame<'_>, scan_state: &ScanState, tui_state: &TuiState) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -114,60 +117,65 @@ fn draw(frame: &mut Frame<'_>, app_state: &AppState) {
         .constraints([Constraint::Min(10), Constraint::Length(8)])
         .split(main_chunks[1]);
 
-    let (scope_done, scope_total) = app_state.current_scope_file_counts();
-    let elapsed = format_duration(app_state.elapsed());
-    let scan_state = if app_state.is_finished() {
+    let (scope_done, scope_total) = tui_state.current_scope_file_counts(scan_state);
+    let elapsed = format_duration(scan_state.elapsed());
+    let status = if scan_state.is_finished() {
         "complete"
     } else {
         "running"
     };
     let summary = Paragraph::new(format!(
         "repo: {}\nstate: {}  elapsed: {}  rev: {}\nscope: {}  focus: {}  jobs: {}  running: {}\ndone: {}/{}  scope files: {}/{}  failures: {}  lines: {}",
-        app_state.repo_root.display(),
-        scan_state,
+        scan_state.repo_root.display(),
+        status,
         elapsed,
-        app_state.rev,
-        app_state.current_scope_label(),
-        focus_label(app_state.focus),
-        app_state.jobs,
-        app_state.running_files(),
-        app_state.processed_files,
-        app_state.total_files,
+        scan_state.rev,
+        tui_state.current_scope_label(scan_state),
+        focus_label(tui_state.focus),
+        scan_state.jobs,
+        scan_state.running_files(),
+        scan_state.processed_files,
+        scan_state.total_files,
         scope_done,
         scope_total,
-        app_state.failed_files,
-        app_state.total_lines,
+        scan_state.failed_files,
+        scan_state.total_lines,
     ))
     .block(Block::default().title("Scan").borders(Borders::ALL));
     frame.render_widget(summary, layout[0]);
 
-    draw_tree(frame, app_state, left_chunks[0]);
-    draw_extensions(frame, app_state, left_chunks[1]);
-    draw_rankings(frame, app_state, right_chunks[0]);
-    draw_recent(frame, app_state, right_chunks[1]);
+    draw_tree(frame, scan_state, tui_state, left_chunks[0]);
+    draw_extensions(frame, scan_state, tui_state, left_chunks[1]);
+    draw_rankings(frame, scan_state, tui_state, right_chunks[0]);
+    draw_recent(frame, scan_state, tui_state, right_chunks[1]);
 
-    let scan_state = if app_state.is_finished() {
+    let footer_status = if scan_state.is_finished() {
         "scan complete"
     } else {
         "scanning..."
     };
     let footer_text = format!(
-        "{scan_state}  focus={}  tab switch pane  q/esc quit\n\
+        "{footer_status}  focus={}  tab switch pane  q/esc quit\n\
 tree: j/k or arrows move  h/l or arrows collapse expand  space toggle subtree/file\n\
 ext:  j/k or arrows move  space toggle extension\n\
 lists: j/k or arrows scroll rankings or recent files",
-        focus_label(app_state.focus),
+        focus_label(tui_state.focus),
     );
     let footer =
         Paragraph::new(footer_text).block(Block::default().title("Bindings").borders(Borders::ALL));
     frame.render_widget(footer, layout[3]);
 }
 
-fn draw_tree(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::layout::Rect) {
-    let visible = app_state.visible_tree_nodes();
+fn draw_tree(
+    frame: &mut Frame<'_>,
+    scan_state: &ScanState,
+    tui_state: &TuiState,
+    area: ratatui::layout::Rect,
+) {
+    let visible = tui_state.visible_tree_nodes(scan_state);
     let selected_index = visible
         .iter()
-        .position(|node| node.node_id == app_state.selected_tree_node)
+        .position(|node| node.node_id == tui_state.selected_tree_node)
         .unwrap_or(0);
     let window = visible_window(
         selected_index,
@@ -179,11 +187,12 @@ fn draw_tree(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::layout:
         .iter()
         .enumerate()
         .map(|(offset, visible_node)| {
-            let node = &app_state.tree_nodes[visible_node.node_id];
-            let marker = if node.enabled { "[x]" } else { "[ ]" };
+            let node = &scan_state.tree_nodes[visible_node.node_id];
+            let node_state = &tui_state.tree_nodes[visible_node.node_id];
+            let marker = if node_state.enabled { "[x]" } else { "[ ]" };
             let expander = match node.kind {
                 NodeKind::File => " ",
-                NodeKind::Directory if node.expanded => "▾",
+                NodeKind::Directory if node_state.expanded => "▾",
                 NodeKind::Directory => "▸",
             };
             let indent = "  ".repeat(visible_node.depth);
@@ -200,7 +209,7 @@ fn draw_tree(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::layout:
                 Cell::from(format!("{}/{}", node.processed_files, node.total_files)),
             ]);
 
-            if window.start + offset == selected_index && app_state.focus == FocusPane::Tree {
+            if window.start + offset == selected_index && tui_state.focus == FocusPane::Tree {
                 row.style(Style::default().add_modifier(Modifier::REVERSED))
             } else {
                 row
@@ -213,34 +222,43 @@ fn draw_tree(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::layout:
     frame.render_widget(table, area);
 }
 
-fn draw_extensions(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::layout::Rect) {
-    let selected_index = app_state
+fn draw_extensions(
+    frame: &mut Frame<'_>,
+    scan_state: &ScanState,
+    tui_state: &TuiState,
+    area: ratatui::layout::Rect,
+) {
+    let selected_index = tui_state
         .selected_extension
-        .min(app_state.extension_filters.len().saturating_sub(1));
+        .min(tui_state.extension_filters.len().saturating_sub(1));
     let window = visible_window(
         selected_index,
-        app_state.extension_filters.len(),
+        scan_state.extensions.len(),
         area.height.saturating_sub(3) as usize,
     );
 
-    let rows = app_state.extension_filters[window.clone()]
+    let rows = scan_state.extensions[window.clone()]
         .iter()
         .enumerate()
-        .map(|(offset, filter)| {
+        .map(|(offset, stat)| {
+            let filter = &tui_state.extension_filters[window.start + offset];
             let row = Row::new([
                 Cell::from(if filter.enabled { "[x]" } else { "[ ]" }),
-                Cell::from(filter.extension.to_string()),
-                Cell::from(format!("{}/{}", filter.processed_files, filter.total_files)),
+                Cell::from(stat.extension.to_string()),
+                Cell::from(format!("{}/{}", stat.processed_files, stat.total_files)),
             ]);
 
-            if window.start + offset == selected_index && app_state.focus == FocusPane::Extensions {
+            if window.start + offset == selected_index && tui_state.focus == FocusPane::Extensions {
                 row.style(Style::default().add_modifier(Modifier::REVERSED))
             } else {
                 row
             }
         });
 
-    let title = format!("Extensions ({})", app_state.selected_extension_label());
+    let title = format!(
+        "Extensions ({})",
+        tui_state.selected_extension_label(scan_state)
+    );
     let table = Table::new(
         rows,
         [
@@ -254,9 +272,14 @@ fn draw_extensions(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::l
     frame.render_widget(table, area);
 }
 
-fn draw_rankings(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::layout::Rect) {
-    let author_rows = app_state.author_rows();
-    let selected_index = app_state
+fn draw_rankings(
+    frame: &mut Frame<'_>,
+    scan_state: &ScanState,
+    tui_state: &TuiState,
+    area: ratatui::layout::Rect,
+) {
+    let author_rows = tui_state.author_rows(scan_state);
+    let selected_index = tui_state
         .selected_author_row
         .min(author_rows.len().saturating_sub(1));
     let window = visible_window(
@@ -277,7 +300,7 @@ fn draw_rankings(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::lay
                 Cell::from(row.commits.to_string()),
             ])
             .style(
-                if window.start + offset == selected_index && app_state.focus == FocusPane::Rankings
+                if window.start + offset == selected_index && tui_state.focus == FocusPane::Rankings
                 {
                     Style::default().add_modifier(Modifier::REVERSED)
                 } else {
@@ -288,7 +311,7 @@ fn draw_rankings(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::lay
 
     let title = format!(
         "Rankings ({}) {}/{}",
-        app_state.current_scope_label(),
+        tui_state.current_scope_label(scan_state),
         selected_index.saturating_add(1).min(author_rows.len()),
         author_rows.len(),
     );
@@ -310,16 +333,21 @@ fn draw_rankings(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::lay
     frame.render_widget(author_table, area);
 }
 
-fn draw_recent(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::layout::Rect) {
-    let selected_index = app_state
+fn draw_recent(
+    frame: &mut Frame<'_>,
+    scan_state: &ScanState,
+    tui_state: &TuiState,
+    area: ratatui::layout::Rect,
+) {
+    let selected_index = tui_state
         .selected_recent_file
-        .min(app_state.recent_files.len().saturating_sub(1));
+        .min(scan_state.recent_files.len().saturating_sub(1));
     let window = visible_window(
         selected_index,
-        app_state.recent_files.len(),
+        scan_state.recent_files.len(),
         area.height.saturating_sub(3) as usize,
     );
-    let recent_rows = app_state
+    let recent_rows = scan_state
         .recent_files
         .iter()
         .skip(window.start)
@@ -338,7 +366,7 @@ fn draw_recent(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::layou
                 Cell::from(file.path.clone()),
             ])
             .style(
-                if window.start + offset == selected_index && app_state.focus == FocusPane::Recent {
+                if window.start + offset == selected_index && tui_state.focus == FocusPane::Recent {
                     Style::default().add_modifier(Modifier::REVERSED)
                 } else {
                     Style::default()
@@ -349,8 +377,8 @@ fn draw_recent(frame: &mut Frame<'_>, app_state: &AppState, area: ratatui::layou
         "Recent Files {}/{}",
         selected_index
             .saturating_add(1)
-            .min(app_state.recent_files.len()),
-        app_state.recent_files.len(),
+            .min(scan_state.recent_files.len()),
+        scan_state.recent_files.len(),
     );
     let recent_table = Table::new(
         recent_rows,

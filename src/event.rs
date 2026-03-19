@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use bstr::BString;
 
-use crate::app::FileSummary;
+use crate::core::FileSummary;
 
 #[derive(Debug)]
 pub enum WorkerEvent {

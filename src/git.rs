@@ -10,7 +10,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use git2::{BlameOptions, ObjectType, Oid, Repository, Tree};
 use smol_str::SmolStr;
 
-use crate::app::{AuthorKey, FileAuthorStat, FileSummary};
+use crate::core::{AuthorKey, FileAuthorStat, FileSummary};
 use crate::event::WorkerEvent;
 
 #[derive(Clone, Debug)]
