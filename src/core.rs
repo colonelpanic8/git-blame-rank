@@ -439,3 +439,316 @@ fn extension_for_path(path: &BString) -> SmolStr {
 pub fn display_path(path: &BString) -> String {
     String::from_utf8_lossy(path.as_slice()).into_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use git2::Oid;
+
+    use super::*;
+
+    fn author(name: &str, email: &str) -> AuthorKey {
+        AuthorKey {
+            name: SmolStr::new(name),
+            email: SmolStr::new(email),
+        }
+    }
+
+    fn oid(hex_digit: char) -> Oid {
+        Oid::from_str(&hex_digit.to_string().repeat(40)).unwrap()
+    }
+
+    fn author_stat(name: &str, email: &str, lines: u32, commit_ids: Vec<Oid>) -> FileAuthorStat {
+        FileAuthorStat {
+            author: author(name, email),
+            lines,
+            commit_ids,
+        }
+    }
+
+    fn summary(path: &str, total_lines: u32, authors: Vec<FileAuthorStat>) -> FileSummary {
+        FileSummary {
+            path: BString::from(path),
+            total_lines,
+            authors,
+        }
+    }
+
+    fn find_node_id(scan_state: &ScanState, path: &str) -> usize {
+        scan_state
+            .tree_nodes
+            .iter()
+            .position(|node| node.path == BString::from(path))
+            .unwrap()
+    }
+
+    #[test]
+    fn author_display_name_uses_unknown_for_empty_name() {
+        assert_eq!(
+            author("", "unknown@example.com").display_name(),
+            "<unknown>"
+        );
+        assert_eq!(author("Alice", "alice@example.com").display_name(), "Alice");
+    }
+
+    #[test]
+    fn scan_state_new_builds_tree_and_extension_indexes() {
+        let scan_state = ScanState::new(
+            PathBuf::from("/repo"),
+            "HEAD".to_owned(),
+            4,
+            vec![
+                BString::from("src/main.rs"),
+                BString::from("src/lib.rs"),
+                BString::from("README"),
+            ],
+        );
+
+        assert_eq!(scan_state.total_files, 3);
+        assert_eq!(scan_state.tree_nodes[0].total_files, 3);
+        assert_eq!(
+            scan_state.tree_nodes[0]
+                .children
+                .iter()
+                .map(|child_id| scan_state.tree_nodes[*child_id].name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src", "README"]
+        );
+        assert_eq!(find_node_id(&scan_state, "src"), 1);
+        assert_eq!(scan_state.file_records.len(), 3);
+        assert!(
+            scan_state
+                .file_records
+                .values()
+                .all(|record| matches!(record.status, FileStatus::Pending))
+        );
+        assert_eq!(
+            scan_state
+                .extensions
+                .iter()
+                .map(|stat| (
+                    stat.extension.as_str(),
+                    stat.total_files,
+                    stat.processed_files
+                ))
+                .collect::<Vec<_>>(),
+            vec![("[no ext]", 1, 0), ("rs", 2, 0)]
+        );
+    }
+
+    #[test]
+    fn apply_worker_event_marks_finished_files_and_updates_aggregates() {
+        let mut scan_state = ScanState::new(
+            PathBuf::from("/repo"),
+            "HEAD".to_owned(),
+            2,
+            vec![BString::from("src/main.rs")],
+        );
+        let file_path = BString::from("src/main.rs");
+        let file_node_id = scan_state.file_records[&file_path].node_id;
+        let parent_node_id = scan_state.tree_nodes[file_node_id].parent.unwrap();
+
+        scan_state.apply_worker_event(WorkerEvent::Started {
+            path: file_path.clone(),
+            worker_id: 0,
+        });
+        assert_eq!(scan_state.running_files(), 1);
+
+        let file_summary = summary(
+            "src/main.rs",
+            5,
+            vec![
+                author_stat("Alice", "alice@example.com", 3, vec![oid('1')]),
+                author_stat("Bob", "bob@example.com", 2, vec![oid('2')]),
+            ],
+        );
+        scan_state.apply_worker_event(WorkerEvent::Finished {
+            path: file_path.clone(),
+            summary: file_summary.clone(),
+            elapsed: Duration::from_millis(25),
+        });
+
+        assert_eq!(scan_state.processed_files, 1);
+        assert_eq!(scan_state.total_lines, 5);
+        assert_eq!(scan_state.failed_files, 0);
+        assert!(scan_state.completed_at.is_some());
+        assert!(matches!(
+            scan_state.file_records[&file_path].status,
+            FileStatus::Complete
+        ));
+        assert_eq!(
+            scan_state.file_records[&file_path]
+                .summary
+                .as_ref()
+                .unwrap()
+                .total_lines,
+            5
+        );
+        assert_eq!(scan_state.tree_nodes[0].processed_files, 1);
+        assert_eq!(scan_state.tree_nodes[parent_node_id].processed_files, 1);
+        assert_eq!(scan_state.tree_nodes[file_node_id].processed_files, 1);
+        assert_eq!(scan_state.extensions[0].processed_files, 1);
+        assert_eq!(scan_state.recent_files.len(), 1);
+        assert_eq!(scan_state.recent_files[0].path, "src/main.rs");
+        assert_eq!(scan_state.recent_files[0].lines, 5);
+        assert!(matches!(
+            scan_state.recent_files[0].status,
+            RecentFileStatus::Complete
+        ));
+        assert_eq!(scan_state.running_files(), 0);
+        assert!(scan_state.is_finished());
+    }
+
+    #[test]
+    fn apply_worker_event_marks_failed_files_and_completes_scan() {
+        let mut scan_state = ScanState::new(
+            PathBuf::from("/repo"),
+            "HEAD".to_owned(),
+            1,
+            vec![BString::from("README.md")],
+        );
+        let file_path = BString::from("README.md");
+
+        scan_state.apply_worker_event(WorkerEvent::Failed {
+            path: file_path.clone(),
+            error: Arc::<str>::from("boom"),
+            elapsed: Duration::from_millis(10),
+        });
+
+        assert_eq!(scan_state.processed_files, 1);
+        assert_eq!(scan_state.failed_files, 1);
+        assert_eq!(scan_state.total_lines, 0);
+        assert!(scan_state.completed_at.is_some());
+        assert!(matches!(
+            scan_state.file_records[&file_path].status,
+            FileStatus::Failed { .. }
+        ));
+        assert_eq!(scan_state.tree_nodes[0].processed_files, 1);
+        assert_eq!(scan_state.extensions[0].processed_files, 1);
+        assert!(matches!(
+            scan_state.recent_files[0].status,
+            RecentFileStatus::Failed
+        ));
+    }
+
+    #[test]
+    fn author_rows_filtered_aggregates_lines_files_and_unique_commits() {
+        let mut scan_state = ScanState::new(
+            PathBuf::from("/repo"),
+            "HEAD".to_owned(),
+            2,
+            vec![BString::from("src/lib.rs"), BString::from("notes.txt")],
+        );
+
+        scan_state.apply_worker_event(WorkerEvent::Finished {
+            path: BString::from("src/lib.rs"),
+            summary: summary(
+                "src/lib.rs",
+                7,
+                vec![
+                    author_stat("Alice", "alice@example.com", 4, vec![oid('1'), oid('1')]),
+                    author_stat("Bob", "bob@example.com", 3, vec![oid('2')]),
+                ],
+            ),
+            elapsed: Duration::default(),
+        });
+        scan_state.apply_worker_event(WorkerEvent::Finished {
+            path: BString::from("notes.txt"),
+            summary: summary(
+                "notes.txt",
+                10,
+                vec![
+                    author_stat("Alice", "alice@example.com", 6, vec![oid('1'), oid('3')]),
+                    author_stat("Cara", "cara@example.com", 4, vec![oid('4')]),
+                ],
+            ),
+            elapsed: Duration::default(),
+        });
+
+        let rows = scan_state.all_author_rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].author.name.as_str(), "Alice");
+        assert_eq!(rows[0].lines, 10);
+        assert_eq!(rows[0].files, 2);
+        assert_eq!(rows[0].commits, 2);
+        assert_eq!(rows[1].author.name.as_str(), "Cara");
+        assert_eq!(rows[2].author.name.as_str(), "Bob");
+
+        let only_rs = scan_state.author_rows_filtered(|record| record.extension == "rs");
+        assert_eq!(only_rs.len(), 2);
+        assert_eq!(only_rs[0].author.name.as_str(), "Alice");
+        assert_eq!(only_rs[0].lines, 4);
+        assert_eq!(only_rs[0].files, 1);
+        assert_eq!(only_rs[0].commits, 1);
+    }
+
+    #[test]
+    fn file_counts_filtered_only_count_finished_and_failed_files_as_processed() {
+        let mut scan_state = ScanState::new(
+            PathBuf::from("/repo"),
+            "HEAD".to_owned(),
+            2,
+            vec![
+                BString::from("src/lib.rs"),
+                BString::from("src/main.rs"),
+                BString::from("README.md"),
+            ],
+        );
+
+        scan_state.apply_worker_event(WorkerEvent::Finished {
+            path: BString::from("src/lib.rs"),
+            summary: summary(
+                "src/lib.rs",
+                3,
+                vec![author_stat("Alice", "a@example.com", 3, vec![oid('1')])],
+            ),
+            elapsed: Duration::default(),
+        });
+        scan_state.apply_worker_event(WorkerEvent::Failed {
+            path: BString::from("README.md"),
+            error: Arc::<str>::from("nope"),
+            elapsed: Duration::default(),
+        });
+
+        let counts = scan_state.file_counts_filtered(|record| record.extension == "rs");
+        assert_eq!(counts, (1, 2));
+
+        let all_counts = scan_state.file_counts_filtered(|_| true);
+        assert_eq!(all_counts, (2, 3));
+    }
+
+    #[test]
+    fn recent_files_are_capped_to_256_entries() {
+        let files = (0..257)
+            .map(|index| BString::from(format!("file-{index}.rs")))
+            .collect::<Vec<_>>();
+        let mut scan_state = ScanState::new(PathBuf::from("/repo"), "HEAD".to_owned(), 1, files);
+
+        for index in 0..257 {
+            scan_state.apply_worker_event(WorkerEvent::Failed {
+                path: BString::from(format!("file-{index}.rs")),
+                error: Arc::<str>::from("failed"),
+                elapsed: Duration::default(),
+            });
+        }
+
+        assert_eq!(scan_state.recent_files.len(), 256);
+        assert_eq!(scan_state.recent_files.front().unwrap().path, "file-256.rs");
+        assert_eq!(scan_state.recent_files.back().unwrap().path, "file-1.rs");
+    }
+
+    #[test]
+    fn extension_for_path_handles_missing_and_present_extensions() {
+        assert_eq!(extension_for_path(&BString::from("src/main.rs")), "rs");
+        assert_eq!(extension_for_path(&BString::from("README")), "[no ext]");
+        assert_eq!(
+            extension_for_path(&BString::from(".gitignore")),
+            "gitignore"
+        );
+    }
+
+    #[test]
+    fn display_path_uses_lossy_utf8_conversion() {
+        let path = BString::from(vec![b'a', b'/', 0xff, b'b']);
+        assert_eq!(display_path(&path), "a/\u{fffd}b");
+    }
+}

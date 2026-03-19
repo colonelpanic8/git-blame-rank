@@ -246,3 +246,258 @@ fn pathbuf_from_bstring(path: &BString) -> PathBuf {
 fn pathbuf_from_bstring(path: &BString) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(path.as_slice()).into_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use git2::{Repository, Signature};
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn init_repo() -> (TempDir, Repository) {
+        let tempdir = TempDir::new().unwrap();
+        let repo = Repository::init(tempdir.path()).unwrap();
+        (tempdir, repo)
+    }
+
+    fn write_file(root: &Path, relative_path: &str, contents: &str) {
+        let file_path = root.join(relative_path);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(file_path, contents).unwrap();
+    }
+
+    fn commit_file(
+        repo: &Repository,
+        relative_path: &str,
+        contents: &str,
+        name: &str,
+        email: &str,
+        message: &str,
+    ) -> Oid {
+        write_file(repo.workdir().unwrap(), relative_path, contents);
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(relative_path)).unwrap();
+        index.write().unwrap();
+
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = Signature::now(name, email).unwrap();
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| repo.find_commit(oid).unwrap());
+        let parents = parent.iter().collect::<Vec<_>>();
+
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn dedupe_commit_ids_sorts_and_removes_duplicates() {
+        let first = Oid::from_str(&"1".repeat(40)).unwrap();
+        let second = Oid::from_str(&"2".repeat(40)).unwrap();
+
+        let deduped = dedupe_commit_ids(vec![second, first, second, first]);
+
+        assert_eq!(deduped, vec![first, second]);
+    }
+
+    #[test]
+    fn discover_files_returns_sorted_blob_paths() {
+        let (_tempdir, repo) = init_repo();
+        commit_file(
+            &repo,
+            "z-last.txt",
+            "z\n",
+            "Alice",
+            "alice@example.com",
+            "add z",
+        );
+        commit_file(
+            &repo,
+            "nested/a-first.rs",
+            "fn main() {}\n",
+            "Bob",
+            "bob@example.com",
+            "add nested file",
+        );
+
+        let files = discover_files(repo.workdir().unwrap(), "HEAD").unwrap();
+
+        assert_eq!(
+            files,
+            vec![
+                BString::from("nested/a-first.rs"),
+                BString::from("z-last.txt")
+            ]
+        );
+    }
+
+    #[test]
+    fn discover_files_returns_revision_errors() {
+        let (_tempdir, repo) = init_repo();
+        commit_file(
+            &repo,
+            "file.txt",
+            "content\n",
+            "Alice",
+            "alice@example.com",
+            "initial",
+        );
+
+        let error = discover_files(repo.workdir().unwrap(), "missing-ref")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("failed to resolve revision missing-ref"));
+    }
+
+    #[test]
+    fn blame_file_aggregates_lines_per_author_and_dedupes_commit_ids() {
+        let (_tempdir, repo) = init_repo();
+        let alice_commit = commit_file(
+            &repo,
+            "src/lib.rs",
+            "alpha\nbeta\ngamma\n",
+            "Alice",
+            "alice@example.com",
+            "initial",
+        );
+        let bob_commit = commit_file(
+            &repo,
+            "src/lib.rs",
+            "alpha\nBETA\ngamma\n",
+            "Bob",
+            "bob@example.com",
+            "update middle line",
+        );
+
+        let summary = blame_file(
+            &repo,
+            resolve_commit_oid(&repo, "HEAD").unwrap(),
+            &BString::from("src/lib.rs"),
+        )
+        .unwrap();
+
+        assert_eq!(summary.path, BString::from("src/lib.rs"));
+        assert_eq!(summary.total_lines, 3);
+        assert_eq!(summary.authors.len(), 2);
+
+        let alice = summary
+            .authors
+            .iter()
+            .find(|stat| stat.author.email == "alice@example.com")
+            .unwrap();
+        assert_eq!(alice.lines, 2);
+        assert_eq!(alice.commit_ids, vec![alice_commit]);
+
+        let bob = summary
+            .authors
+            .iter()
+            .find(|stat| stat.author.email == "bob@example.com")
+            .unwrap();
+        assert_eq!(bob.lines, 1);
+        assert_eq!(bob.commit_ids, vec![bob_commit]);
+    }
+
+    #[test]
+    fn start_scan_emits_started_and_terminal_events_for_each_file() {
+        let (_tempdir, repo) = init_repo();
+        commit_file(
+            &repo,
+            "tracked.txt",
+            "line one\nline two\n",
+            "Alice",
+            "alice@example.com",
+            "initial",
+        );
+
+        let handle = start_scan(
+            ScanConfig {
+                repo_root: repo.workdir().unwrap().to_path_buf(),
+                rev: Arc::<str>::from("HEAD"),
+                jobs: 2,
+            },
+            &[BString::from("tracked.txt"), BString::from("missing.txt")],
+        );
+        let events = handle.event_rx.iter().collect::<Vec<_>>();
+        handle.join();
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, WorkerEvent::Started { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, WorkerEvent::Finished { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, WorkerEvent::Failed { .. }))
+                .count(),
+            1
+        );
+
+        let finished = events
+            .iter()
+            .find_map(|event| match event {
+                WorkerEvent::Finished { path, summary, .. } => Some((path, summary)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(finished.0, &BString::from("tracked.txt"));
+        assert_eq!(finished.1.total_lines, 2);
+
+        let failed = events
+            .iter()
+            .find_map(|event| match event {
+                WorkerEvent::Failed { path, error, .. } => Some((path, error)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(failed.0, &BString::from("missing.txt"));
+        assert!(failed.1.contains("failed to blame missing.txt"));
+    }
+
+    #[test]
+    fn start_scan_reports_failures_when_repository_cannot_be_opened() {
+        let missing_repo = TempDir::new().unwrap();
+        let repo_root = missing_repo.path().join("does-not-exist");
+        let handle = start_scan(
+            ScanConfig {
+                repo_root,
+                rev: Arc::<str>::from("HEAD"),
+                jobs: 1,
+            },
+            &[BString::from("a.rs"), BString::from("b.rs")],
+        );
+        let events = handle.event_rx.iter().collect::<Vec<_>>();
+        handle.join();
+
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, WorkerEvent::Failed { elapsed, .. } if *elapsed == Default::default())));
+    }
+}
