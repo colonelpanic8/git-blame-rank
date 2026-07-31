@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use smol_str::SmolStr;
 
 use crate::core::{AuthorRow, FileRecord, NodeKind, ScanState, display_path};
+use crate::settings::RepoSettings;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FocusPane {
@@ -38,11 +40,22 @@ pub struct TuiState {
     pub selected_author_row: usize,
     pub selected_recent_file: usize,
     pub focus: FocusPane,
+    /// Outcome of the most recent settings save, shown in the footer.
+    pub settings_status: Option<String>,
     extension_index_by_name: HashMap<SmolStr, usize>,
+    settings: RepoSettings,
+    settings_path: Option<PathBuf>,
 }
 
 impl TuiState {
-    pub fn new(scan_state: &ScanState) -> Self {
+    /// Builds interactive state on top of the settings the scan already applied.
+    ///
+    /// `settings_path` is `None` when persistence is disabled for this run.
+    pub fn new(
+        scan_state: &ScanState,
+        settings: RepoSettings,
+        settings_path: Option<PathBuf>,
+    ) -> Self {
         let tree_nodes = scan_state
             .tree_nodes
             .iter()
@@ -72,7 +85,63 @@ impl TuiState {
             selected_author_row: 0,
             selected_recent_file: 0,
             focus: FocusPane::Tree,
+            settings_status: None,
             extension_index_by_name,
+            settings,
+            settings_path,
+        }
+    }
+
+    pub fn settings_path(&self) -> Option<&std::path::Path> {
+        self.settings_path.as_deref()
+    }
+
+    /// Merges the panes' disabled entries into the settings loaded at startup.
+    ///
+    /// Entries the scan already skipped stay ignored, so saving never silently
+    /// re-enables something the settings file had excluded.
+    pub fn pending_settings(&self, scan_state: &ScanState) -> RepoSettings {
+        let mut settings = self.settings.clone();
+
+        let mut disabled_paths = Vec::new();
+        self.push_disabled_paths(scan_state, 0, &mut disabled_paths);
+        for path in disabled_paths {
+            settings.ignore_path(&path);
+        }
+
+        for (index, filter) in self.extension_filters.iter().enumerate() {
+            if !filter.enabled
+                && let Some(stat) = scan_state.extensions.get(index)
+            {
+                settings.ignore_extension(stat.extension.as_str());
+            }
+        }
+
+        settings
+    }
+
+    /// Persists the current ignore selections, recording the outcome for display.
+    pub fn save_settings(&mut self, scan_state: &ScanState) {
+        let Some(path) = self.settings_path.clone() else {
+            self.settings_status =
+                Some("settings not saved: persistence disabled for this run".to_owned());
+            return;
+        };
+
+        let settings = self.pending_settings(scan_state);
+        match settings.save(&path) {
+            Ok(()) => {
+                self.settings_status = Some(format!(
+                    "saved {} path and {} extension rules to {}",
+                    settings.ignored_paths.len(),
+                    settings.ignored_extensions.len(),
+                    path.display(),
+                ));
+                self.settings = settings;
+            }
+            Err(error) => {
+                self.settings_status = Some(format!("failed to save settings: {error}"));
+            }
         }
     }
 
@@ -232,6 +301,23 @@ impl TuiState {
         }
     }
 
+    /// Collects the topmost disabled nodes, skipping paths that are not UTF-8.
+    ///
+    /// Descendants are implied by their ancestor, so recursion stops at the
+    /// first disabled node on each branch.
+    fn push_disabled_paths(&self, scan_state: &ScanState, node_id: usize, out: &mut Vec<String>) {
+        if node_id != 0 && !self.tree_nodes[node_id].enabled {
+            if let Ok(path) = std::str::from_utf8(scan_state.tree_nodes[node_id].path.as_slice()) {
+                out.push(path.to_owned());
+            }
+            return;
+        }
+
+        for child_id in &scan_state.tree_nodes[node_id].children {
+            self.push_disabled_paths(scan_state, *child_id, out);
+        }
+    }
+
     fn push_visible_tree_nodes(
         &self,
         scan_state: &ScanState,
@@ -257,6 +343,7 @@ mod tests {
 
     use bstr::BString;
     use git2::Oid;
+    use tempfile::TempDir;
 
     use crate::core::{AuthorKey, FileAuthorStat, FileSummary};
     use crate::event::WorkerEvent;
@@ -326,7 +413,7 @@ mod tests {
     #[test]
     fn new_initializes_root_expanded_and_all_filters_enabled() {
         let scan_state = sample_scan_state();
-        let tui_state = TuiState::new(&scan_state);
+        let tui_state = TuiState::new(&scan_state, RepoSettings::default(), None);
 
         assert!(tui_state.tree_nodes[0].expanded);
         assert!(tui_state.tree_nodes.iter().all(|node| node.enabled));
@@ -342,7 +429,7 @@ mod tests {
     #[test]
     fn visible_tree_nodes_expand_and_collapse_with_navigation() {
         let scan_state = sample_scan_state();
-        let mut tui_state = TuiState::new(&scan_state);
+        let mut tui_state = TuiState::new(&scan_state, RepoSettings::default(), None);
         let src_node = find_node_id(&scan_state, "src");
 
         let initial_visible = tui_state.visible_tree_nodes(&scan_state);
@@ -395,7 +482,7 @@ mod tests {
     #[test]
     fn author_rows_and_counts_respect_scope_and_extension_filters() {
         let scan_state = sample_scan_state();
-        let mut tui_state = TuiState::new(&scan_state);
+        let mut tui_state = TuiState::new(&scan_state, RepoSettings::default(), None);
         let src_node = find_node_id(&scan_state, "src");
         tui_state.selected_tree_node = src_node;
 
@@ -421,7 +508,7 @@ mod tests {
     #[test]
     fn toggling_tree_node_disables_entire_subtree() {
         let scan_state = sample_scan_state();
-        let mut tui_state = TuiState::new(&scan_state);
+        let mut tui_state = TuiState::new(&scan_state, RepoSettings::default(), None);
         let src_node = find_node_id(&scan_state, "src");
         let src_lib = find_node_id(&scan_state, "src/lib.rs");
         let src_main = find_node_id(&scan_state, "src/main.rs");
@@ -440,9 +527,68 @@ mod tests {
     }
 
     #[test]
+    fn pending_settings_merges_disabled_nodes_with_loaded_rules() {
+        let scan_state = sample_scan_state();
+        let mut loaded = RepoSettings::default();
+        loaded.ignore_path("vendor");
+        let mut tui_state = TuiState::new(&scan_state, loaded, None);
+
+        tui_state.selected_tree_node = find_node_id(&scan_state, "src");
+        tui_state.toggle_selected_tree_node(&scan_state);
+        tui_state.selected_extension = scan_state
+            .extensions
+            .iter()
+            .position(|stat| stat.extension == "md")
+            .unwrap();
+        tui_state.toggle_selected_extension();
+
+        let settings = tui_state.pending_settings(&scan_state);
+
+        assert_eq!(settings.ignored_paths, vec!["src", "vendor"]);
+        assert_eq!(settings.ignored_extensions, vec!["md"]);
+    }
+
+    #[test]
+    fn save_settings_writes_the_file_and_reports_the_outcome() {
+        let tempdir = TempDir::new().unwrap();
+        let path = RepoSettings::settings_path(tempdir.path());
+        let scan_state = sample_scan_state();
+        let mut tui_state = TuiState::new(&scan_state, RepoSettings::default(), Some(path.clone()));
+
+        tui_state.selected_tree_node = find_node_id(&scan_state, "src");
+        tui_state.toggle_selected_tree_node(&scan_state);
+        tui_state.save_settings(&scan_state);
+
+        assert!(
+            tui_state
+                .settings_status
+                .as_deref()
+                .unwrap()
+                .starts_with("saved 1 path and 0 extension rules")
+        );
+        assert_eq!(
+            RepoSettings::load(&path).unwrap().ignored_paths,
+            vec!["src"]
+        );
+    }
+
+    #[test]
+    fn save_settings_reports_when_persistence_is_disabled() {
+        let scan_state = sample_scan_state();
+        let mut tui_state = TuiState::new(&scan_state, RepoSettings::default(), None);
+
+        tui_state.save_settings(&scan_state);
+
+        assert_eq!(
+            tui_state.settings_status.as_deref(),
+            Some("settings not saved: persistence disabled for this run")
+        );
+    }
+
+    #[test]
     fn selection_helpers_and_focus_cycle_clamp_safely() {
         let scan_state = sample_scan_state();
-        let mut tui_state = TuiState::new(&scan_state);
+        let mut tui_state = TuiState::new(&scan_state, RepoSettings::default(), None);
 
         tui_state.move_extension_selection(50);
         assert_eq!(

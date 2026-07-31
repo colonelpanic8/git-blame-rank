@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind};
@@ -8,6 +9,7 @@ use crossterm::terminal::{
 };
 use git_blame_rank::core::{NodeKind, RecentFileStatus, ScanState};
 use git_blame_rank::event::WorkerEvent;
+use git_blame_rank::settings::RepoSettings;
 use git_blame_rank::tui_state::{FocusPane, TuiState};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -18,13 +20,15 @@ use ratatui::{Frame, Terminal};
 pub fn run(
     scan_state: &mut ScanState,
     event_rx: &crossbeam_channel::Receiver<WorkerEvent>,
+    settings: RepoSettings,
+    settings_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut tui_state = TuiState::new(scan_state);
+    let mut tui_state = TuiState::new(scan_state, settings, settings_path);
 
     let result = run_loop(&mut terminal, scan_state, &mut tui_state, event_rx);
 
@@ -77,6 +81,7 @@ fn run_loop(
                             tui_state.expand_selected(scan_state);
                         }
                     }
+                    KeyCode::Char('s') => tui_state.save_settings(scan_state),
                     KeyCode::Char(' ') => match tui_state.focus {
                         FocusPane::Tree => tui_state.toggle_selected_tree_node(scan_state),
                         FocusPane::Extensions => tui_state.toggle_selected_extension(),
@@ -98,7 +103,7 @@ fn draw(frame: &mut Frame<'_>, scan_state: &ScanState, tui_state: &TuiState) {
             Constraint::Length(5),
             Constraint::Min(14),
             Constraint::Length(8),
-            Constraint::Length(4),
+            Constraint::Length(7),
         ])
         .split(frame.area());
 
@@ -154,11 +159,19 @@ fn draw(frame: &mut Frame<'_>, scan_state: &ScanState, tui_state: &TuiState) {
     } else {
         "scanning..."
     };
+    let settings_line = match tui_state.settings_status.as_deref() {
+        Some(status) => status.to_owned(),
+        None => match tui_state.settings_path() {
+            Some(path) => format!("settings: {} (s saves ignore rules)", path.display()),
+            None => "settings: disabled for this run".to_owned(),
+        },
+    };
     let footer_text = format!(
-        "{footer_status}  focus={}  tab switch pane  q/esc quit\n\
+        "{footer_status}  focus={}  tab switch pane  s save settings  q/esc quit\n\
 tree: j/k or arrows move  h/l or arrows collapse expand  space toggle subtree/file\n\
 ext:  j/k or arrows move  space toggle extension\n\
-lists: j/k or arrows scroll rankings or recent files",
+lists: j/k or arrows scroll rankings or recent files\n\
+{settings_line}",
         focus_label(tui_state.focus),
     );
     let footer =

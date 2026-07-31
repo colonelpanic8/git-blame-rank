@@ -190,7 +190,7 @@ impl ScanState {
                 tree_nodes[current_node].total_files += 1;
             }
 
-            let extension = extension_for_path(&path);
+            let extension = extension_for_path(path.as_slice());
             *extension_counts.entry(extension.clone()).or_default() += 1;
             file_records.insert(
                 path.clone(),
@@ -389,7 +389,7 @@ impl ScanState {
             cursor = self.tree_nodes[current].parent;
         }
 
-        let extension = extension_for_path(path);
+        let extension = extension_for_path(path.as_slice());
         if let Some(stat) = self
             .extensions
             .iter_mut()
@@ -427,9 +427,9 @@ fn sort_tree_children(tree_nodes: &mut [TreeNode], node_id: usize) {
     }
 }
 
-fn extension_for_path(path: &BString) -> SmolStr {
-    let display = display_path(path);
-    let filename = display.rsplit('/').next().unwrap_or(display.as_str());
+pub fn extension_for_path(path: &[u8]) -> SmolStr {
+    let display = String::from_utf8_lossy(path);
+    let filename = display.rsplit('/').next().unwrap_or(display.as_ref());
     match filename.rsplit_once('.') {
         Some((_, extension)) if !extension.is_empty() => SmolStr::new(extension),
         _ => SmolStr::new("[no ext]"),
@@ -738,12 +738,9 @@ mod tests {
 
     #[test]
     fn extension_for_path_handles_missing_and_present_extensions() {
-        assert_eq!(extension_for_path(&BString::from("src/main.rs")), "rs");
-        assert_eq!(extension_for_path(&BString::from("README")), "[no ext]");
-        assert_eq!(
-            extension_for_path(&BString::from(".gitignore")),
-            "gitignore"
-        );
+        assert_eq!(extension_for_path(b"src/main.rs"), "rs");
+        assert_eq!(extension_for_path(b"README"), "[no ext]");
+        assert_eq!(extension_for_path(b".gitignore"), "gitignore");
     }
 
     #[test]

@@ -12,6 +12,7 @@ use smol_str::SmolStr;
 
 use crate::core::{AuthorKey, FileAuthorStat, FileSummary};
 use crate::event::WorkerEvent;
+use crate::settings::RepoSettings;
 
 #[derive(Clone, Debug)]
 pub struct ScanConfig {
@@ -47,12 +48,17 @@ pub fn resolve_repo_root(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("failed to resolve repository root {}", workdir.display()))
 }
 
-pub fn discover_files(repo_root: &Path, rev: &str) -> Result<Vec<BString>> {
+/// Enumerates the blob paths of `rev`, skipping anything `settings` ignores.
+pub fn discover_files(
+    repo_root: &Path,
+    rev: &str,
+    settings: &RepoSettings,
+) -> Result<Vec<BString>> {
     let repo = Repository::open(repo_root)
         .with_context(|| format!("failed to open repository at {}", repo_root.display()))?;
     let tree = resolve_tree(&repo, rev)?;
     let mut files = Vec::new();
-    walk_tree(&repo, &tree, Vec::new(), &mut files)?;
+    walk_tree(&repo, &tree, Vec::new(), settings, &mut files)?;
     files.sort();
     Ok(files)
 }
@@ -169,6 +175,7 @@ fn walk_tree(
     repo: &Repository,
     tree: &Tree<'_>,
     prefix: Vec<u8>,
+    settings: &RepoSettings,
     files: &mut Vec<BString>,
 ) -> Result<()> {
     for entry in tree.iter() {
@@ -176,13 +183,21 @@ fn walk_tree(
         path.extend_from_slice(entry.name_bytes());
 
         match entry.kind() {
-            Some(ObjectType::Blob) => files.push(BString::from(path)),
+            Some(ObjectType::Blob) => {
+                if !settings.is_ignored(&path) {
+                    files.push(BString::from(path));
+                }
+            }
             Some(ObjectType::Tree) => {
+                if settings.is_path_ignored(&path) {
+                    continue;
+                }
+
                 path.push(b'/');
                 let subtree = repo
                     .find_tree(entry.id())
                     .with_context(|| "failed to load subtree while walking repository")?;
-                walk_tree(repo, &subtree, path, files)?;
+                walk_tree(repo, &subtree, path, settings, files)?;
             }
             _ => {}
         }
@@ -348,7 +363,8 @@ mod tests {
             "add nested file",
         );
 
-        let files = discover_files(repo.workdir().unwrap(), "HEAD").unwrap();
+        let files =
+            discover_files(repo.workdir().unwrap(), "HEAD", &RepoSettings::default()).unwrap();
 
         assert_eq!(
             files,
@@ -357,6 +373,43 @@ mod tests {
                 BString::from("z-last.txt")
             ]
         );
+    }
+
+    #[test]
+    fn discover_files_skips_ignored_directories_and_extensions() {
+        let (_tempdir, repo) = init_repo();
+        commit_file(
+            &repo,
+            "src/lib.rs",
+            "fn main() {}\n",
+            "Alice",
+            "alice@example.com",
+            "add lib",
+        );
+        commit_file(
+            &repo,
+            "vendor/deep/nested.rs",
+            "vendored\n",
+            "Bob",
+            "bob@example.com",
+            "add vendored file",
+        );
+        commit_file(
+            &repo,
+            "Cargo.lock",
+            "lockfile\n",
+            "Bob",
+            "bob@example.com",
+            "add lockfile",
+        );
+
+        let mut settings = RepoSettings::default();
+        settings.ignore_path("vendor");
+        settings.ignore_extension("lock");
+
+        let files = discover_files(repo.workdir().unwrap(), "HEAD", &settings).unwrap();
+
+        assert_eq!(files, vec![BString::from("src/lib.rs")]);
     }
 
     #[test]
@@ -389,9 +442,13 @@ mod tests {
             "initial",
         );
 
-        let error = discover_files(repo.workdir().unwrap(), "missing-ref")
-            .unwrap_err()
-            .to_string();
+        let error = discover_files(
+            repo.workdir().unwrap(),
+            "missing-ref",
+            &RepoSettings::default(),
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("failed to resolve revision missing-ref"));
     }
